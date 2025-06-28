@@ -2,125 +2,134 @@ import pandas as pd
 import os
 import cv2
 from pathlib import Path
+import numpy as np
 
-base_path = Path("") # add your path here
-output_path = Path("dataset")
+base_path = Path("")  # Add your sessions root path here
+output_path = Path("data")
 camera_filenames = ["camA.mp4", "camB.mp4", "camC.mp4", "camD.mp4", "camE.mp4"]
 train_ratio = 0.8
-FRAME_NAME_PATTERN = "session_sample_{idx:05d}_cam{cam_letter}.png"
+FRAME_FOLDER_PATTERN = "frame_{idx:06d}"
+FRAME_IMAGE_PATTERN = "cam{cam_num}.jpg"  # Using cam1, cam2, ... for naming
 
 TRAIN_DIR = output_path / "train"
-TEST_DIR = output_path / "test"
-LABELS_PATH = output_path / "labels.csv"
+VAL_DIR = output_path / "val"
 
-def process_session(session_dir: Path,
-                    global_labels: pd.DataFrame,
-                    seen_uids: set) -> pd.DataFrame:
+def process_session(session_dir: Path, train_ratio: float):
+    print(f"▶ Processing session {session_dir.name}")
 
-    session = session_dir.name
-    print(f"▶ Processing {session}")
-
-    # Videos Routes
     video_folder = session_dir / "videos-raw"
+    csv_folder = session_dir / "pose-3d"
+
     video_paths = [video_folder / f"cam{c}.mp4" for c in "ABCDE"]
     if not all(p.exists() for p in video_paths):
-        print(f"  ⚠️  Missing camera videos in {video_folder} → skipping")
-        return global_labels
+        print(f"  ⚠️  Missing camera videos in {video_folder} → skipping session")
+        return [], []
 
-    # CSV Route
-    csv_folder = session_dir / "pose-3d"
     csv_files = list(csv_folder.glob("*.csv"))
     if len(csv_files) != 1:
-        print(f"  ⚠️  Expected 1 CSV in {csv_folder}, found {len(csv_files)} → skipping")
-        return global_labels
+        print(f"  ⚠️  Expected exactly 1 CSV in {csv_folder}, found {len(csv_files)} → skipping session")
+        return [], []
+
     csv_file = csv_files[0]
-
-    # Open Videos
-    caps = [cv2.VideoCapture(str(p)) for p in video_paths]
-    if not all(cap.isOpened() for cap in caps):
-        print(f"  ❌ Could not open all video files in {session} → skipping")
-        return global_labels
-
-    # Read CSV
     session_labels = pd.read_csv(csv_file)
     if session_labels.empty:
-        print(f"  ⚠️  CSV {csv_file.name} is empty → skipping")
-        return global_labels
+        print(f"  ⚠️  CSV file {csv_file.name} is empty → skipping session")
+        return [], []
 
-    num_rows   = len(session_labels)
-    frame_cnts = [int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) for cap in caps]
-    samples    = min(min(frame_cnts), num_rows)
-    split_idx  = int(samples * train_ratio)
+    caps = [cv2.VideoCapture(str(p)) for p in video_paths]
+    if not all(cap.isOpened() for cap in caps):
+        print(f"  ❌ Could not open all videos in session {session_dir.name} → skipping session")
+        for cap in caps:
+            cap.release()
+        return [], []
 
-    cam_letters = ["A", "B", "C", "D", "E"]
+    num_frames = len(session_labels)
+    frame_counts = [int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) for cap in caps]
+    samples = min(min(frame_counts), num_frames)
+    split_idx = int(samples * train_ratio)
+
+    train_samples = []
+    val_samples = []
 
     for i in range(samples):
-        uid = f"{session}_sample_{i:05d}"
-        if uid in seen_uids:
-            print(f"  🔁 Duplicate UID {uid} found → skipping")
-            continue
+        # Determine train or val split
+        split = "train" if i < split_idx else "val"
+        out_dir = TRAIN_DIR if split == "train" else VAL_DIR
 
-        split = "train" if i < split_idx else "test"
-        out_dir = TRAIN_DIR if split == "train" else TEST_DIR
+        frame_folder_name = FRAME_FOLDER_PATTERN.format(idx=i)
+        frame_folder = out_dir / "frames" / frame_folder_name
+        frame_folder.mkdir(parents=True, exist_ok=True)
 
-        frame_files = []
+        frame_images = []
         for cam_idx, cap in enumerate(caps):
-            cam_letter = cam_letters[cam_idx]
             ok, frame = cap.read()
             if not ok:
-                print(f"  ⚠️  Could not read frame {i} from cam{cam_letter} → stopping session")
+                print(f"  ⚠️  Could not read frame {i} from cam{cam_idx+1} → stopping session early")
                 samples = i
                 break
 
-            fname = FRAME_NAME_PATTERN.format(session=session, idx=i, cam_letter=cam_letter)
-            fpath = out_dir / fname
-            fpath.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(fpath), frame)
-            frame_files.append(str(fpath.relative_to(output_path)))
+            img_name = FRAME_IMAGE_PATTERN.format(cam_num=cam_idx+1)
+            img_path = frame_folder / img_name
+            cv2.imwrite(str(img_path), frame)
+            frame_images.append(str(img_path.relative_to(output_path)))
+
         else:
-            # Only 3D coordinates
-            row_data = session_labels.iloc[i].copy()
-            xyz_cols = [col for col in row_data.index if col.endswith(("_x", "_y", "_z"))]
-            row_filtered = row_data[xyz_cols].copy()
+            # Extract 3D joint coordinates columns from CSV (all cols ending with _x, _y, _z)
+            row = session_labels.iloc[i]
+            xyz_cols = [col for col in row.index if col.endswith(('_x', '_y', '_z'))]
+            coords = row[xyz_cols].to_numpy(dtype=np.float32)
 
-            row_filtered["sample_uid"]  = uid
-            row_filtered["session"]     = session
-            row_filtered["split"]       = split
-            row_filtered["frame_files"] = ";".join(frame_files)
+            # Reshape into (21, 3) assuming 21 joints * 3 coords (x,y,z)
+            joints3d = coords.reshape(-1, 3)
 
-            global_labels = pd.concat([global_labels, row_filtered.to_frame().T], ignore_index=True)
+            # Save joints3d as .npy
+            joints_dir = out_dir / "joints3d"
+            joints_dir.mkdir(parents=True, exist_ok=True)
+            joints_path = joints_dir / f"{frame_folder_name}.npy"
+            np.save(joints_path, joints3d)
+
+            # Store sample info for optional CSV log (can be omitted)
+            sample_info = {
+                "session": session_dir.name,
+                "frame_folder": str(frame_folder.relative_to(output_path)),
+                "split": split,
+                "frame_files": ";".join(frame_images),
+                "joints_path": str(joints_path.relative_to(output_path))
+            }
+            if split == "train":
+                train_samples.append(sample_info)
+            else:
+                val_samples.append(sample_info)
+
             continue
         break
 
     for cap in caps:
         cap.release()
 
-    print(f"✅ Processed {samples} frames for session {session} "
-          f"({split_idx} train / {samples - split_idx} test)")
-    return global_labels
+    print(f"✅ Processed {samples} frames for session {session_dir.name} ({split_idx} train / {samples - split_idx} val)")
+    return train_samples, val_samples
 
 def main():
-    output_path.mkdir(parents=True, exist_ok=True)
+    output_path.mkdir(exist_ok=True)
     TRAIN_DIR.mkdir(exist_ok=True)
-    TEST_DIR.mkdir(exist_ok=True)
-    
-    if LABELS_PATH.exists():
-        labels_master = pd.read_csv(LABELS_PATH)
-    else:
-        labels_master = pd.DataFrame()
-        
-    seen = set(labels_master.get("sample_uid", []))
-    
+    VAL_DIR.mkdir(exist_ok=True)
+
+    all_train_samples = []
+    all_val_samples = []
+
     for session_folder in sorted(base_path.iterdir()):
         if session_folder.is_dir() and session_folder.name.startswith("session"):
-            labels_master = process_session(session_folder, labels_master, seen)
-            seen = set(labels_master["sample_uid"])
-            
-    labels_master.to_csv(LABELS_PATH, index=False)
-    print(f"\n labels.csv with {len(labels_master)} total samples saved → "
-          f"{LABELS_PATH.resolve()}")
-    
+            train_samples, val_samples = process_session(session_folder, train_ratio)
+            all_train_samples.extend(train_samples)
+            all_val_samples.extend(val_samples)
+
+    # Optional: Save a master CSV log for reference
+    log_df = pd.DataFrame(all_train_samples + all_val_samples)
+    log_path = output_path / "dataset_log.csv"
+    log_df.to_csv(log_path, index=False)
+    print(f"\nDataset log saved to {log_path.resolve()}")
+
 if __name__ == "__main__":
     main()
-    print("✅ Processing complete.")
-            
+    print("✅ Dataset processing complete.")
